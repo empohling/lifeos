@@ -40,6 +40,7 @@ Cada linha é um par HTML + JS isolado (ver §4.1). As páginas moram em `lifeos
 | `tarefas.html` | `tarefas.js` | Tarefas completo (kanban, lista, gráficos); só lê Projetos | `lifeos-tarefas`, `lifeos-projetos` |
 | `notas.html` | `notas.js` | Notas em markdown, N:N com projetos — ver [`NOTAS.md`](../docs/NOTAS.md) | `lifeos-notas` |
 | `memoria.html` | `memoria.js` | Memória de longo prazo das IAs (índice + registros) — `LIFEOS.md` §17 | `lifeos-memorias` |
+| `renuncias.html` | `renuncias.js` | Renúncias: tempo sem cada hábito, marcos, recaídas — `LIFEOS.md` §19 | `lifeos-renuncias` |
 | `publicar.html`, `senhas.html`, `temas.html`, `tags.html`, `automacao.html`, `mcp.html` | homônimos | Telas de configuração do drawer | `lifeos-config`, `lifeos-senhas`, `lifeos-vocabularios`… |
 | `tutorial.html` | — | Guia de uso, sem gate e sem JS próprio | — |
 | `index.html` | inline | Apresentação pública do LifeOS, sem gate — `LIFEOS.md` §18 | — |
@@ -102,6 +103,7 @@ Navegação entre telas é sempre `<a href>` real — nunca uma "página" trocad
 - Contrato: `POST {token, action, …}` → `{ok: true, …}` ou `{ok: false, error: "<codigo>"}`. Códigos de erro curtos (`invalid_titulo`, `not_found`, `unauthorized`); o front traduz num mapa `ERRO`
 - Validação e limites (`MAX_*`) vivem na Edge Function; o front e o MCP **copiam** os mesmos limites
 - O MCP (`lifeos-mcp`) fala direto com o PostgREST — não passa pelas Edge Functions de domínio. Mudou regra de validação num domínio, muda no MCP também
+- **Leitura no banco, nunca em memória.** Lista inteira passa por `selectTodas()` (paginada — o PostgREST corta em 1000 linhas sem erro); busca do MCP filtra, ordena e limita na query (`selectPagina()`). N:N por embed, nunca `in.(...)` com ids de todas as linhas. Toda `order` termina em `id`. Ver `LIFEOS.md` §6.5
 - A lista de functions a deployar está em `SETUP.md` — function nova entra lá; migration nova é aplicada em ordem numérica
 - CORS é `*` por padrão (`LIFEOS_ALLOWED_ORIGIN` restringe) — a fronteira é a senha, não a origem (`OPENSOURCE.md` §5.4)
 

@@ -4,7 +4,7 @@
 // -- pensado pra ser cadastrado como "custom connector" em claude.ai (Settings
 // > Connectors > Add custom connector, colando a URL desta function + token).
 // Expoe tools de CONSULTA sobre todo o sistema (Notas, Tarefas, Projetos,
-// Eventos, Manifestações, Citações, Finanças) e tools de ESCRITA em cinco
+// Eventos, Manifestações, Citações, Finanças, Renúncias) e tools de ESCRITA em cinco
 // domínios: Notas (create_nota, update_nota), Tarefas (create_tarefa,
 // update_tarefa), Eventos (create_evento, update_evento), Finanças
 // (create_movimentacao, update_movimentacao) e Citações (create_citacao --
@@ -208,6 +208,71 @@ function strArray(v: unknown): string[] {
   return Array.isArray(v) ? v.map((x) => String(x)) : [];
 }
 
+// ── Leitura no banco ──────────────────────────────────────────────────────
+// Toda tool filtra, ordena e limita no PostgREST -- nenhuma baixa a tabela
+// inteira para filtrar em memória. Baixar tudo tinha dois tetos silenciosos:
+// o max-rows do PostgREST (1000 no Supabase) corta as linhas ANTES do
+// filtro, sem erro, e um `in.(...)` com ids de todas as linhas estoura o
+// limite de URL do gateway. Toda `order` termina numa coluna única (id):
+// sem isso, linhas empatadas (importação em lote divide o mesmo
+// created_at) trocam de lugar entre chamadas e o `limit` corta uma
+// diferente a cada vez.
+const PAGINA = 1000;
+
+// Uma página do resultado + o total que casou com o filtro (Content-Range:
+// "0-19/108", ou "*/0" sem resultado).
+async function selectPagina(REST: string, headers: Record<string, string>, tabela: string, q: URLSearchParams): Promise<{ rows: any[]; total: number }> {
+  const r = await fetch(`${REST}/${tabela}?${q}`, { headers: { ...headers, Prefer: "count=exact" } });
+  if (!r.ok) throw new Error(`select ${tabela} -> ${r.status} ${await r.text()}`);
+  const rows = await r.json();
+  const total = Number((r.headers.get("content-range") || "").split("/")[1]);
+  return { rows, total: Number.isFinite(total) ? total : rows.length };
+}
+
+// Todas as linhas que casam com `q`, página a página -- só para quem precisa
+// do conjunto inteiro (resumo_financeiro, catálogo de projetos, índice da
+// memória). Uma leitura única parava em 1000 linhas parecendo completa.
+async function selectTodas(REST: string, headers: Record<string, string>, tabela: string, q: URLSearchParams): Promise<any[]> {
+  const out: any[] = [];
+  for (;;) {
+    const p = new URLSearchParams(q);
+    p.set("limit", String(PAGINA));
+    p.set("offset", String(out.length));
+    const { rows, total } = await selectPagina(REST, headers, tabela, p);
+    out.push(...rows);
+    if (!rows.length || out.length >= total) return out;
+  }
+}
+
+// Valor de `ilike` para "contém <trecho>". `%`, `_` e `\` são escapados
+// (o LIKE do Postgres usa `\` como escape padrão). O PostgREST troca TODO
+// `*` por `%` e não tem escape para ele, então um `*` digitado vira `_`
+// (exatamente um caractere qualquer) -- o mais perto de literal que dá.
+function ilikeContem(trecho: string): string {
+  const esc = trecho.replace(/[\\%_]/g, (c) => "\\" + c).replace(/\*/g, "_");
+  return `*${esc}*`;
+}
+// Valores entre aspas para vírgula, parêntese, chave ou acento não quebrarem
+// o operador: `{"a","b"}` (array, para ov/cs) e `("a","b")` (para in).
+function pgQuote(v: string): string {
+  return `"${v.replace(/[\\"]/g, (c) => "\\" + c)}"`;
+}
+function pgArrayLiteral(vals: string[]): string {
+  return "{" + vals.map(pgQuote).join(",") + "}";
+}
+function pgInList(vals: string[]): string {
+  return "(" + vals.map(pgQuote).join(",") + ")";
+}
+function dataValida(s: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const d = new Date(s + "T00:00:00Z");
+  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+function erroDatas(...datas: string[]) {
+  const invalidas = datas.filter((d) => d && !dataValida(d));
+  return invalidas.length ? toolText(`Data(s) inválida(s): ${invalidas.join(", ")}. Use o formato YYYY-MM-DD.`, true) : null;
+}
+
 // ── Definições das tools (JSON Schema) ────────────────────────────────────
 //
 // É uma FUNÇÃO, não uma constante: os `enum` de cada inputSchema saem do
@@ -232,7 +297,7 @@ function buildTools() {
         tipo: { type: "array", items: { type: "string", enum: VOCAB.nota_tipo }, description: "Um ou mais tipos/tags -- entra se tiver QUALQUER UM." },
         data_inicio: { type: "string", description: "Data mínima YYYY-MM-DD (inclusive)." },
         data_fim: { type: "string", description: "Data máxima YYYY-MM-DD (inclusive)." },
-        limit: { type: "integer", description: "Máximo de resultados (padrão 20, máximo 50)." },
+        limit: { type: "integer", description: "Máximo de resultados (padrão 20, máximo 50; com data_inicio E data_fim, máximo 100)." },
       },
     },
   },
@@ -442,6 +507,27 @@ function buildTools() {
         autor: { type: "string", description: "Nome de quem disse." },
       },
       required: ["texto", "autor"],
+    },
+  },
+  {
+    name: "search_renuncias",
+    description:
+      "Lê as renúncias do usuário: hábitos que ele cortou e há quanto tempo " +
+      "está sem cada um. Para cada renúncia devolve desde quando (a última " +
+      "vez), o tempo corrido, os marcos de tempo já conquistados (1 dia, 3, " +
+      "7, 14, 21, 1 mês, 2, 3, 6, 9 meses, 1, 2, 3, 5, 10 anos — mês = 30 " +
+      "dias, ano = 365), o próximo marco com quanto falta e a data em que " +
+      "chega, o nº de recaídas e o recorde. Sem filtros devolve as ativas, " +
+      "da mais antiga para a mais recente. Só leitura: criar, editar e " +
+      "registrar recaída é pela tela do LifeOS.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        nome: { type: "string", description: "Trecho do nome da renúncia (não precisa ser exato)." },
+        incluir_arquivadas: { type: "boolean", description: "Inclui as arquivadas (padrão false)." },
+        historico: { type: "boolean", description: "Inclui a lista de tentativas anteriores (início, fim, duração) de cada renúncia (padrão false)." },
+        limit: { type: "integer", description: "Máximo de resultados (padrão 20, máximo 50)." },
+      },
     },
   },
   {
@@ -724,7 +810,7 @@ Deno.serve(async (req) => {
       return respond(rpcResult(id, {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "lifeos-mcp", version: "2.5.0" },
+        serverInfo: { name: "lifeos-mcp", version: "2.7.0" },
         instructions: await buildInstructions(REST, restHeaders),
       }));
     }
@@ -752,6 +838,7 @@ Deno.serve(async (req) => {
         search_manifestacoes: (a) => handleSearchManifestacoes(REST, restHeaders, a),
         search_citacoes: (a) => handleSearchCitacoes(REST, restHeaders, a),
         create_citacao: (a) => handleCreateCitacao(REST, restHeaders, a),
+        search_renuncias: (a) => handleSearchRenuncias(REST, restHeaders, a),
         list_memorias: (a) => handleListMemorias(REST, restHeaders, a),
         get_memoria: (a) => handleGetMemoria(REST, restHeaders, a),
         create_memoria: (a) => handleCreateMemoria(REST, restHeaders, a),
@@ -784,9 +871,7 @@ function respond(body: unknown) {
 // ── Projetos: fetch compartilhado por várias tools (join/label/filtro) ───
 type ProjetoRow = { id: string; name: string; emoji: string | null; status: string; tags: string[] };
 async function fetchAllProjetos(REST: string, headers: Record<string, string>): Promise<ProjetoRow[]> {
-  const r = await fetch(`${REST}/lifeos_projetos?order=name.asc`, { headers });
-  if (!r.ok) throw new Error(`select projetos -> ${r.status} ${await r.text()}`);
-  return r.json();
+  return selectTodas(REST, headers, "lifeos_projetos", new URLSearchParams({ order: "name.asc,id.asc" }));
 }
 function projetoLabel(p: { name: string; emoji: string | null }) {
   return (p.emoji ? p.emoji + " " : "") + p.name;
@@ -810,58 +895,57 @@ function resolveProjetoFiltro(projetos: ProjetoRow[], termosRaw: string[]): { id
 }
 
 // ── Tool: search_notas ────────────────────────────────────────────────────
-async function fetchProjetoIdsByNota(REST: string, headers: Record<string, string>, notaIds: string[]) {
-  const map: Record<string, string[]> = {};
-  if (!notaIds.length) return map;
-  const idsFilter = notaIds.join(",");
-  const r = await fetch(`${REST}/lifeos_notas_projetos?nota_id=in.(${idsFilter})`, { headers });
-  if (!r.ok) throw new Error(`select notas_projetos -> ${r.status} ${await r.text()}`);
-  const rows: { nota_id: string; projeto_id: string }[] = await r.json();
-  for (const row of rows) {
-    if (!map[row.nota_id]) map[row.nota_id] = [];
-    map[row.nota_id].push(row.projeto_id);
-  }
-  return map;
-}
-
 async function handleSearchNotas(REST: string, headers: Record<string, string>, args: Record<string, any>) {
-  const nome = args?.nome ? String(args.nome).trim().toLowerCase() : "";
+  const nome = args?.nome ? String(args.nome).trim() : "";
   const tipoFiltro = strArray(args?.tipo);
   const dataInicio = args?.data_inicio ? String(args.data_inicio) : "";
   const dataFim = args?.data_fim ? String(args.data_fim) : "";
-  const limit = clampLimit(args?.limit);
+  // Mesmo padrão de search_movimentacoes: intervalo fechado de datas é um
+  // pedido de "ler o período", então o teto sobe.
+  const limit = clampLimit(args?.limit, 20, (dataInicio && dataFim) ? 100 : 50);
 
   const invalidTipo = tipoFiltro.filter((t) => !VOCAB.nota_tipo.includes(t));
   if (invalidTipo.length) return toolText(`Tipo(s) inválido(s): ${invalidTipo.join(", ")}. Valores aceitos: ${VOCAB.nota_tipo.join(", ")}.`, true);
+  const erroData = erroDatas(dataInicio, dataFim);
+  if (erroData) return erroData;
 
-  const [notasRes, projetos] = await Promise.all([
-    fetch(`${REST}/lifeos_notas?order=data.desc.nullslast,created_at.desc`, { headers }),
-    fetchAllProjetos(REST, headers),
+  // Os projetos servem aos rótulos do retorno e ao filtro. Com filtro, a
+  // query das notas depende deles; sem filtro, as duas buscas correm juntas.
+  const projetosP = fetchAllProjetos(REST, headers);
+  const termosProjeto = strArray(args?.projetos);
+  const { ids: projetoIdsFiltro, warnings } = termosProjeto.length
+    ? resolveProjetoFiltro(await projetosP, termosProjeto)
+    : { ids: null, warnings: [] as string[] };
+  // Nenhum termo bateu com projeto: o filtro é vazio e nada passa, sem
+  // precisar ir ao banco.
+  if (projetoIdsFiltro && !projetoIdsFiltro.size) {
+    return toolText(JSON.stringify({ total_matches: 0, returned: 0, truncated: false, warnings, notas: [] }, null, 2));
+  }
+
+  // Dois embeds da mesma tabela de vínculo: `projs` traz TODOS os projetos
+  // de cada nota (para o retorno); `filt`, vazio e !inner, só filtra.
+  // Assim o filtro por projeto não encolhe a lista de projetos da nota.
+  const q = new URLSearchParams();
+  q.set("select", "id,name,tipo,data,conteudo_md,projs:lifeos_notas_projetos(projeto_id)" + (projetoIdsFiltro ? ",filt:lifeos_notas_projetos!inner()" : ""));
+  if (projetoIdsFiltro) q.set("filt.projeto_id", `in.(${[...projetoIdsFiltro].join(",")})`);
+  if (nome) q.set("name", "ilike." + ilikeContem(nome));
+  if (tipoFiltro.length) q.set("tipo", "ov." + pgArrayLiteral(tipoFiltro));
+  if (dataInicio) q.append("data", "gte." + dataInicio);
+  if (dataFim) q.append("data", "lte." + dataFim);
+  q.set("order", "data.desc.nullslast,created_at.desc,id.desc");
+  q.set("limit", String(limit));
+
+  const [{ rows, total: totalMatches }, projetos] = await Promise.all([
+    selectPagina(REST, headers, "lifeos_notas", q),
+    projetosP,
   ]);
-  if (!notasRes.ok) throw new Error(`select notas -> ${notasRes.status} ${await notasRes.text()}`);
-  const rows = await notasRes.json();
-  const projetoMap = await fetchProjetoIdsByNota(REST, headers, rows.map((r: any) => r.id));
   const projetoById = new Map(projetos.map((p) => [p.id, p]));
 
-  const { ids: projetoIdsFiltro, warnings } = resolveProjetoFiltro(projetos, strArray(args?.projetos));
-
-  let notas = rows.map((row: any) => ({
+  const returned = rows.map((row: any) => ({
     id: row.id, name: row.name, tipo: row.tipo ?? [], data: row.data,
-    conteudo_md: row.conteudo_md, projeto_ids: projetoMap[row.id] ?? [],
-  }));
-
-  if (nome) notas = notas.filter((n: any) => n.name.toLowerCase().includes(nome));
-  if (tipoFiltro.length) notas = notas.filter((n: any) => (n.tipo || []).some((t: string) => tipoFiltro.includes(t)));
-  if (projetoIdsFiltro) notas = notas.filter((n: any) => (n.projeto_ids || []).some((pid: string) => projetoIdsFiltro.has(pid)));
-  if (dataInicio) notas = notas.filter((n: any) => n.data && n.data >= dataInicio);
-  if (dataFim) notas = notas.filter((n: any) => n.data && n.data <= dataFim);
-
-  const totalMatches = notas.length;
-  const returned = notas.slice(0, limit).map((n: any) => ({
-    id: n.id, name: n.name, tipo: n.tipo, data: n.data,
-    projetos: (n.projeto_ids || []).map((pid: string) => projetoById.get(pid)).filter(Boolean).map((p: any) => ({ id: p.id, name: projetoLabel(p) })),
-    snippet: noteSnippet(n.conteudo_md),
-    conteudo_md: n.conteudo_md,
+    projetos: (row.projs || []).map((l: { projeto_id: string }) => projetoById.get(l.projeto_id)).filter(Boolean).map((p: any) => ({ id: p.id, name: projetoLabel(p) })),
+    snippet: noteSnippet(row.conteudo_md),
+    conteudo_md: row.conteudo_md,
   }));
 
   return toolText(JSON.stringify({
@@ -988,7 +1072,7 @@ async function handleUpdateNota(REST: string, headers: Record<string, string>, a
 
 // ── Tool: search_tarefas ──────────────────────────────────────────────────
 async function handleSearchTarefas(REST: string, headers: Record<string, string>, args: Record<string, any>) {
-  const nome = args?.nome ? String(args.nome).trim().toLowerCase() : "";
+  const nome = args?.nome ? String(args.nome).trim() : "";
   const status = args?.status ? String(args.status) : "";
   if (status && !VOCAB.tarefa_status.includes(status)) return toolText(`Status inválido: ${status}. Valores aceitos: ${VOCAB.tarefa_status.join(", ")}.`, true);
   const tipoFiltro = strArray(args?.tipo);
@@ -996,29 +1080,40 @@ async function handleSearchTarefas(REST: string, headers: Record<string, string>
   if (invalidTipo.length) return toolText(`Tipo(s) inválido(s): ${invalidTipo.join(", ")}. Valores aceitos: ${VOCAB.tarefa_tipo.join(", ")}.`, true);
   const dataInicio = args?.data_entrega_inicio ? String(args.data_entrega_inicio) : "";
   const dataFim = args?.data_entrega_fim ? String(args.data_entrega_fim) : "";
+  const erroData = erroDatas(dataInicio, dataFim);
+  if (erroData) return erroData;
   const limit = clampLimit(args?.limit);
 
-  const [tarefasRes, projetos] = await Promise.all([
-    fetch(`${REST}/lifeos_tarefas?order=created_at.asc`, { headers }),
-    fetchAllProjetos(REST, headers),
+  // Mesmo desenho de search_notas: com filtro de projeto, a query depende
+  // dos ids resolvidos; sem filtro, as duas buscas correm juntas.
+  const projetosP = fetchAllProjetos(REST, headers);
+  const termosProjeto = strArray(args?.projetos);
+  const { ids: projetoIdsFiltro, warnings } = termosProjeto.length
+    ? resolveProjetoFiltro(await projetosP, termosProjeto)
+    : { ids: null, warnings: [] as string[] };
+  if (projetoIdsFiltro && !projetoIdsFiltro.size) {
+    return toolText(JSON.stringify({ total_matches: 0, returned: 0, truncated: false, warnings, tarefas: [] }, null, 2));
+  }
+
+  const q = new URLSearchParams();
+  q.set("select", "id,name,status,tipo,projeto_id,data_entrega");
+  if (nome) q.set("name", "ilike." + ilikeContem(nome));
+  if (status) q.set("status", "eq." + status);
+  if (tipoFiltro.length) q.set("tipo", "ov." + pgArrayLiteral(tipoFiltro));
+  if (projetoIdsFiltro) q.set("projeto_id", `in.(${[...projetoIdsFiltro].join(",")})`);
+  if (dataInicio) q.append("data_entrega", "gte." + dataInicio);
+  if (dataFim) q.append("data_entrega", "lte." + dataFim);
+  q.set("order", "created_at.asc,id.asc");
+  q.set("limit", String(limit));
+
+  const [{ rows, total: totalMatches }, projetos] = await Promise.all([
+    selectPagina(REST, headers, "lifeos_tarefas", q),
+    projetosP,
   ]);
-  if (!tarefasRes.ok) throw new Error(`select tarefas -> ${tarefasRes.status} ${await tarefasRes.text()}`);
-  const rows = await tarefasRes.json();
   const projetoById = new Map(projetos.map((p) => [p.id, p]));
-  const { ids: projetoIdsFiltro, warnings } = resolveProjetoFiltro(projetos, strArray(args?.projetos));
 
-  let tarefas = rows.map((r: any) => ({ id: r.id, name: r.name, status: r.status, tipo: r.tipo ?? [], projeto_id: r.projeto_id, data_entrega: r.data_entrega }));
-
-  if (nome) tarefas = tarefas.filter((t: any) => t.name.toLowerCase().includes(nome));
-  if (status) tarefas = tarefas.filter((t: any) => t.status === status);
-  if (tipoFiltro.length) tarefas = tarefas.filter((t: any) => (t.tipo || []).some((x: string) => tipoFiltro.includes(x)));
-  if (projetoIdsFiltro) tarefas = tarefas.filter((t: any) => projetoIdsFiltro.has(t.projeto_id));
-  if (dataInicio) tarefas = tarefas.filter((t: any) => t.data_entrega && t.data_entrega >= dataInicio);
-  if (dataFim) tarefas = tarefas.filter((t: any) => t.data_entrega && t.data_entrega <= dataFim);
-
-  const totalMatches = tarefas.length;
-  const returned = tarefas.slice(0, limit).map((t: any) => ({
-    id: t.id, name: t.name, status: t.status, tipo: t.tipo, data_entrega: t.data_entrega,
+  const returned = rows.map((t: any) => ({
+    id: t.id, name: t.name, status: t.status, tipo: t.tipo ?? [], data_entrega: t.data_entrega,
     projeto: projetoById.has(t.projeto_id) ? { id: t.projeto_id, name: projetoLabel(projetoById.get(t.projeto_id)!) } : null,
   }));
 
@@ -1028,7 +1123,6 @@ async function handleSearchTarefas(REST: string, headers: Record<string, string>
   }, null, 2));
 }
 
-// ── Tool: create_tarefa ───────────────────────────────────────────────────
 async function handleCreateTarefa(REST: string, headers: Record<string, string>, args: Record<string, any>) {
   const name = String(args?.name ?? "").trim();
   if (!name) return toolText("O parâmetro name (nome da tarefa) é obrigatório e não pode ser vazio.", true);
@@ -1125,7 +1219,7 @@ async function handleUpdateTarefa(REST: string, headers: Record<string, string>,
 
 // ── Tool: search_projetos ─────────────────────────────────────────────────
 async function handleSearchProjetos(REST: string, headers: Record<string, string>, args: Record<string, any>) {
-  const nome = args?.nome ? String(args.nome).trim().toLowerCase() : "";
+  const nome = args?.nome ? String(args.nome).trim() : "";
   const status = args?.status ? String(args.status) : "";
   if (status && !VOCAB.projeto_status.includes(status)) return toolText(`Status inválido: ${status}. Valores aceitos: ${VOCAB.projeto_status.join(", ")}.`, true);
   const tagsFiltro = strArray(args?.tags);
@@ -1133,13 +1227,16 @@ async function handleSearchProjetos(REST: string, headers: Record<string, string
   if (invalidTags.length) return toolText(`Tag(s) inválida(s): ${invalidTags.join(", ")}. Valores aceitos: ${VOCAB.projeto_tag.join(", ")}.`, true);
   const limit = clampLimit(args?.limit);
 
-  let projetos = await fetchAllProjetos(REST, headers);
-  if (nome) projetos = projetos.filter((p) => p.name.toLowerCase().includes(nome));
-  if (status) projetos = projetos.filter((p) => p.status === status);
-  if (tagsFiltro.length) projetos = projetos.filter((p) => (p.tags || []).some((t) => tagsFiltro.includes(t)));
+  const q = new URLSearchParams();
+  q.set("select", "id,name,emoji,status,tags");
+  if (nome) q.set("name", "ilike." + ilikeContem(nome));
+  if (status) q.set("status", "eq." + status);
+  if (tagsFiltro.length) q.set("tags", "ov." + pgArrayLiteral(tagsFiltro));
+  q.set("order", "name.asc,id.asc");
+  q.set("limit", String(limit));
+  const { rows, total: totalMatches } = await selectPagina(REST, headers, "lifeos_projetos", q);
 
-  const totalMatches = projetos.length;
-  const returned = projetos.slice(0, limit).map((p) => ({ id: p.id, name: p.name, emoji: p.emoji, status: p.status, tags: p.tags }));
+  const returned = rows.map((p: any) => ({ id: p.id, name: p.name, emoji: p.emoji, status: p.status, tags: p.tags }));
 
   return toolText(JSON.stringify({
     total_matches: totalMatches, returned: returned.length, truncated: totalMatches > returned.length, projetos: returned,
@@ -1148,37 +1245,47 @@ async function handleSearchProjetos(REST: string, headers: Record<string, string
 
 // ── Tool: search_eventos ──────────────────────────────────────────────────
 async function handleSearchEventos(REST: string, headers: Record<string, string>, args: Record<string, any>) {
-  const nome = args?.nome ? String(args.nome).trim().toLowerCase() : "";
+  const nome = args?.nome ? String(args.nome).trim() : "";
   const tipoFiltro = strArray(args?.tipo);
   const invalidTipo = tipoFiltro.filter((t) => !VOCAB.evento_tipo.includes(t));
   if (invalidTipo.length) return toolText(`Tipo(s) inválido(s): ${invalidTipo.join(", ")}. Valores aceitos: ${VOCAB.evento_tipo.join(", ")}.`, true);
   const dataInicio = args?.data_inicio ? String(args.data_inicio) : "";
   const dataFim = args?.data_fim ? String(args.data_fim) : "";
+  const erroData = erroDatas(dataInicio, dataFim);
+  if (erroData) return erroData;
   const limit = clampLimit(args?.limit);
 
-  const [eventosRes, projetos] = await Promise.all([
-    fetch(`${REST}/lifeos_eventos?order=date.desc`, { headers }),
-    fetchAllProjetos(REST, headers),
-  ]);
-  if (!eventosRes.ok) throw new Error(`select eventos -> ${eventosRes.status} ${await eventosRes.text()}`);
-  const rows = await eventosRes.json();
-  const projetoById = new Map(projetos.map((p) => [p.id, p]));
-  const { ids: projetoIdsFiltro, warnings } = resolveProjetoFiltro(projetos, strArray(args?.projetos));
+  const projetosP = fetchAllProjetos(REST, headers);
+  const termosProjeto = strArray(args?.projetos);
+  const { ids: projetoIdsFiltro, warnings } = termosProjeto.length
+    ? resolveProjetoFiltro(await projetosP, termosProjeto)
+    : { ids: null, warnings: [] as string[] };
+  if (projetoIdsFiltro && !projetoIdsFiltro.size) {
+    return toolText(JSON.stringify({ total_matches: 0, returned: 0, truncated: false, warnings, eventos: [] }, null, 2));
+  }
 
-  let eventos = rows.map((r: any) => ({ id: r.id, name: r.name, date: r.date, date_fim: r.date_fim ?? null, tipo: r.tipo, projeto_id: r.projeto_id ?? null }));
-
-  if (nome) eventos = eventos.filter((e: any) => e.name.toLowerCase().includes(nome));
-  if (tipoFiltro.length) eventos = eventos.filter((e: any) => tipoFiltro.includes(e.tipo));
-  if (projetoIdsFiltro) eventos = eventos.filter((e: any) => e.projeto_id && projetoIdsFiltro.has(e.projeto_id));
+  const q = new URLSearchParams();
+  q.set("select", "id,name,date,date_fim,tipo,projeto_id");
+  if (nome) q.set("name", "ilike." + ilikeContem(nome));
+  if (tipoFiltro.length) q.set("tipo", "in." + pgInList(tipoFiltro));
+  if (projetoIdsFiltro) q.set("projeto_id", `in.(${[...projetoIdsFiltro].join(",")})`);
   // Sobreposição, não só "date dentro do range" -- um evento de vários dias
   // que começou antes de data_inicio mas ainda estava em curso precisa
-  // entrar (mesmo racional de handleQuery em lifeos-eventos).
-  if (dataInicio) eventos = eventos.filter((e: any) => (e.date_fim || e.date) >= dataInicio);
-  if (dataFim) eventos = eventos.filter((e: any) => e.date <= dataFim);
+  // entrar (mesmo racional de handleQuery em lifeos-eventos): o fim do
+  // evento (date_fim, ou date quando é de um dia só) >= data_inicio.
+  if (dataInicio) q.set("or", `(date_fim.gte.${dataInicio},and(date_fim.is.null,date.gte.${dataInicio}))`);
+  if (dataFim) q.set("date", "lte." + dataFim);
+  q.set("order", "date.desc,created_at.desc,id.desc");
+  q.set("limit", String(limit));
 
-  const totalMatches = eventos.length;
-  const returned = eventos.slice(0, limit).map((e: any) => ({
-    id: e.id, name: e.name, date: e.date, date_fim: e.date_fim, tipo: e.tipo,
+  const [{ rows, total: totalMatches }, projetos] = await Promise.all([
+    selectPagina(REST, headers, "lifeos_eventos", q),
+    projetosP,
+  ]);
+  const projetoById = new Map(projetos.map((p) => [p.id, p]));
+
+  const returned = rows.map((e: any) => ({
+    id: e.id, name: e.name, date: e.date, date_fim: e.date_fim ?? null, tipo: e.tipo,
     projeto: (e.projeto_id && projetoById.has(e.projeto_id)) ? { id: e.projeto_id, name: projetoLabel(projetoById.get(e.projeto_id)!) } : null,
   }));
 
@@ -1188,7 +1295,6 @@ async function handleSearchEventos(REST: string, headers: Record<string, string>
   }, null, 2));
 }
 
-// ── Tool: create_evento ───────────────────────────────────────────────────
 async function handleCreateEvento(REST: string, headers: Record<string, string>, args: Record<string, any>) {
   const name = String(args?.name ?? "").trim();
   if (!name) return toolText("O parâmetro name (nome do evento) é obrigatório e não pode ser vazio.", true);
@@ -1319,7 +1425,7 @@ async function handleUpdateEvento(REST: string, headers: Record<string, string>,
 
 // ── Tool: search_manifestacoes ────────────────────────────────────────────
 async function handleSearchManifestacoes(REST: string, headers: Record<string, string>, args: Record<string, any>) {
-  const nome = args?.nome ? String(args.nome).trim().toLowerCase() : "";
+  const nome = args?.nome ? String(args.nome).trim() : "";
   const status = args?.status ? String(args.status) : "";
   if (status && !VOCAB.manifestacao_status.includes(status)) return toolText(`Status inválido: ${status}. Valores aceitos: ${VOCAB.manifestacao_status.join(", ")}.`, true);
   const tagsFiltro = strArray(args?.tags);
@@ -1327,17 +1433,16 @@ async function handleSearchManifestacoes(REST: string, headers: Record<string, s
   if (invalidTags.length) return toolText(`Tag(s) inválida(s): ${invalidTags.join(", ")}. Valores aceitos: ${VOCAB.manifestacao_tag.join(", ")}.`, true);
   const limit = clampLimit(args?.limit);
 
-  const r = await fetch(`${REST}/lifeos_manifestacoes?order=created_at.asc`, { headers });
-  if (!r.ok) throw new Error(`select manifestacoes -> ${r.status} ${await r.text()}`);
-  const rows = await r.json();
+  const q = new URLSearchParams();
+  q.set("select", "id,name,status,tags,descricao,banner_url");
+  if (nome) q.set("name", "ilike." + ilikeContem(nome));
+  if (status) q.set("status", "eq." + status);
+  if (tagsFiltro.length) q.set("tags", "ov." + pgArrayLiteral(tagsFiltro));
+  q.set("order", "created_at.asc,id.asc");
+  q.set("limit", String(limit));
+  const { rows, total: totalMatches } = await selectPagina(REST, headers, "lifeos_manifestacoes", q);
 
-  let manifestacoes = rows.map((row: any) => ({ id: row.id, name: row.name, status: row.status, tags: row.tags ?? [], descricao: row.descricao, banner_url: row.banner_url }));
-  if (nome) manifestacoes = manifestacoes.filter((m: any) => m.name.toLowerCase().includes(nome));
-  if (status) manifestacoes = manifestacoes.filter((m: any) => m.status === status);
-  if (tagsFiltro.length) manifestacoes = manifestacoes.filter((m: any) => (m.tags || []).some((t: string) => tagsFiltro.includes(t)));
-
-  const totalMatches = manifestacoes.length;
-  const returned = manifestacoes.slice(0, limit);
+  const returned = rows.map((row: any) => ({ id: row.id, name: row.name, status: row.status, tags: row.tags ?? [], descricao: row.descricao, banner_url: row.banner_url }));
 
   return toolText(JSON.stringify({
     total_matches: totalMatches, returned: returned.length, truncated: totalMatches > returned.length, manifestacoes: returned,
@@ -1346,20 +1451,19 @@ async function handleSearchManifestacoes(REST: string, headers: Record<string, s
 
 // ── Tool: search_citacoes ─────────────────────────────────────────────────
 async function handleSearchCitacoes(REST: string, headers: Record<string, string>, args: Record<string, any>) {
-  const texto = args?.texto ? String(args.texto).trim().toLowerCase() : "";
-  const autor = args?.autor ? String(args.autor).trim().toLowerCase() : "";
+  const texto = args?.texto ? String(args.texto).trim() : "";
+  const autor = args?.autor ? String(args.autor).trim() : "";
   const limit = clampLimit(args?.limit);
 
-  const r = await fetch(`${REST}/lifeos_citacoes?order=created_at.asc`, { headers });
-  if (!r.ok) throw new Error(`select citacoes -> ${r.status} ${await r.text()}`);
-  const rows = await r.json();
+  const q = new URLSearchParams();
+  q.set("select", "id,texto,autor");
+  if (texto) q.set("texto", "ilike." + ilikeContem(texto));
+  if (autor) q.set("autor", "ilike." + ilikeContem(autor));
+  q.set("order", "created_at.asc,id.asc");
+  q.set("limit", String(limit));
+  const { rows, total: totalMatches } = await selectPagina(REST, headers, "lifeos_citacoes", q);
 
-  let citacoes = rows.map((row: any) => ({ id: row.id, texto: row.texto, autor: row.autor }));
-  if (texto) citacoes = citacoes.filter((c: any) => c.texto.toLowerCase().includes(texto));
-  if (autor) citacoes = citacoes.filter((c: any) => c.autor.toLowerCase().includes(autor));
-
-  const totalMatches = citacoes.length;
-  const returned = citacoes.slice(0, limit);
+  const returned = rows.map((row: any) => ({ id: row.id, texto: row.texto, autor: row.autor }));
 
   return toolText(JSON.stringify({
     total_matches: totalMatches, returned: returned.length, truncated: totalMatches > returned.length, citacoes: returned,
@@ -1419,12 +1523,10 @@ type MemoriaIdx = {
 async function fetchMemoriasIndice(REST: string, headers: Record<string, string>): Promise<MemoriaIdx[]> {
   // Os ids dos registros vêm embutidos só pra contar -- mais portátil que
   // depender de aggregate no PostgREST, e o volume é de uso pessoal.
-  const r = await fetch(
-    `${REST}/lifeos_memorias?select=id,titulo,descricao,categoria,updated_at,lifeos_memoria_registros(id)&order=titulo.asc`,
-    { headers },
-  );
-  if (!r.ok) throw new Error(`select memorias -> ${r.status} ${await r.text()}`);
-  const rows = await r.json();
+  const rows = await selectTodas(REST, headers, "lifeos_memorias", new URLSearchParams({
+    select: "id,titulo,descricao,categoria,updated_at,lifeos_memoria_registros(id)",
+    order: "titulo.asc,id.asc",
+  }));
   return rows.map((m: any) => ({
     id: m.id, titulo: m.titulo, descricao: m.descricao ?? "", categoria: m.categoria,
     updated_at: m.updated_at, registros: (m.lifeos_memoria_registros ?? []).length,
@@ -1507,6 +1609,101 @@ async function buildInstructions(REST: string, headers: Record<string, string>):
   if (cortado) indice += "\n(… índice cortado por tamanho -- use list_memorias para ver todas.)";
 
   return base + "\n\nÍndice de memória:" + indice;
+}
+
+// ── Tool: search_renuncias ────────────────────────────────────────────────
+// Só leitura (decisão do autor, out/2026): criar, editar e recaída são da
+// tela. A escala de marcos é CÓPIA de MARCOS em assets/js/renuncias.js --
+// mudou lá, muda aqui, senão a IA e a tela discordam do "próximo marco".
+const RENUNCIA_MARCOS: { dias: number; rot: string }[] = [
+  { dias: 1, rot: "1 dia" }, { dias: 3, rot: "3 dias" }, { dias: 7, rot: "7 dias" },
+  { dias: 14, rot: "14 dias" }, { dias: 21, rot: "21 dias" }, { dias: 30, rot: "1 mês" },
+  { dias: 60, rot: "2 meses" }, { dias: 90, rot: "3 meses" }, { dias: 180, rot: "6 meses" },
+  { dias: 270, rot: "9 meses" }, { dias: 365, rot: "1 ano" }, { dias: 730, rot: "2 anos" },
+  { dias: 1095, rot: "3 anos" }, { dias: 1825, rot: "5 anos" }, { dias: 3650, rot: "10 anos" },
+];
+const DIA_MS = 86400000;
+
+// "47d 5h", "3h 12m", "1a 20d" -- mesmo formato curto da tela (duracao()).
+function duracaoCurta(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d >= 365) return `${Math.floor(d / 365)}a ${d % 365}d`;
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
+}
+
+// Instante em hora de Brasília, "AAAA-MM-DD HH:MM" -- o modelo fala com o
+// usuário em hora local, não em UTC.
+function horaSaoPaulo(ms: number): string {
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+}
+
+async function handleSearchRenuncias(REST: string, headers: Record<string, string>, args: Record<string, any>) {
+  const nome = args?.nome ? String(args.nome).trim() : "";
+  const incluirArquivadas = args?.incluir_arquivadas === true;
+  const comHistorico = args?.historico === true;
+  const limit = clampLimit(args?.limit);
+
+  const q = new URLSearchParams();
+  q.set("select", "id,nome,emoji,desde,arquivada,tentativas:lifeos_renuncia_tentativas(inicio,fim)");
+  if (nome) q.set("nome", "ilike." + ilikeContem(nome));
+  if (!incluirArquivadas) q.set("arquivada", "eq.false");
+  q.set("order", "desde.asc,id.asc");
+  q.set("limit", String(limit));
+  const { rows, total: totalMatches } = await selectPagina(REST, headers, "lifeos_renuncias", q);
+
+  const agora = Date.now();
+  const returned = rows.map((r: any) => {
+    const desde = Date.parse(r.desde);
+    const ms = Math.max(0, agora - desde);
+    const tents = (Array.isArray(r.tentativas) ? r.tentativas : [])
+      .map((t: any) => ({ inicio: Date.parse(t.inicio), fim: Date.parse(t.fim) }))
+      .sort((a: any, b: any) => b.fim - a.fim);
+    const melhorAnterior = tents.reduce((m: number, t: any) => Math.max(m, t.fim - t.inicio), 0);
+    const conquistados = RENUNCIA_MARCOS.filter((m) => m.dias * DIA_MS <= ms);
+    const prox = RENUNCIA_MARCOS.find((m) => m.dias * DIA_MS > ms) || null;
+    const recorde = Math.max(ms, melhorAnterior);
+
+    const out: Record<string, unknown> = {
+      nome: r.nome,
+      emoji: r.emoji,
+      arquivada: !!r.arquivada,
+      desde: horaSaoPaulo(desde),
+      tempo_sem: duracaoCurta(ms),
+      dias_sem: Math.floor(ms / DIA_MS),
+      ultimo_marco: conquistados.length ? conquistados[conquistados.length - 1].rot : null,
+      marcos_conquistados: `${conquistados.length}/${RENUNCIA_MARCOS.length}`,
+      proximo_marco: prox
+        ? {
+          marco: prox.rot,
+          faltam: duracaoCurta(prox.dias * DIA_MS - ms),
+          chega_em: horaSaoPaulo(desde + prox.dias * DIA_MS),
+          progresso_pct: Math.round((ms / (prox.dias * DIA_MS)) * 100),
+        }
+        : null,
+      recaidas: tents.length,
+      recorde: duracaoCurta(recorde),
+      recorde_e_a_atual: ms >= melhorAnterior,
+    };
+    if (comHistorico) {
+      out.historico = tents.map((t: any) => ({
+        inicio: horaSaoPaulo(t.inicio), fim: horaSaoPaulo(t.fim), duracao: duracaoCurta(t.fim - t.inicio),
+      }));
+    }
+    return out;
+  });
+
+  return toolText(JSON.stringify({
+    consultado_em: horaSaoPaulo(agora) + " (America/Sao_Paulo)",
+    total_matches: totalMatches, returned: returned.length, truncated: totalMatches > returned.length, renuncias: returned,
+  }, null, 2));
 }
 
 // ── Tool: list_memorias ───────────────────────────────────────────────────
@@ -2522,11 +2719,12 @@ function criarAnalise(
 // ═══ RESUMO FINANCEIRO · fim ═════════════════════════════════════════════
 
 // ── Tool: resumo_financeiro ───────────────────────────────────────────────
-// Uma leitura só, do começo da tabela até 2 meses depois do último mês pedido
-// ou do mês corrente (o que vier depois). Sem limite inferior porque a cadeia
-// de faturas (carryInto) olha pra trás sem limite fixo; o teto cobre os
-// lançamentos futuros que a projeção usa. A tabela é de uso pessoal (~100
-// linhas/mês): mais simples e exato que buscar sob demanda.
+// Lê do começo da tabela até 2 meses depois do último mês pedido ou do mês
+// corrente (o que vier depois). Sem limite inferior porque a cadeia de
+// faturas (carryInto) olha pra trás sem limite fixo; o teto cobre os
+// lançamentos futuros que a projeção usa. Paginado (selectTodas): com ~100
+// linhas/mês a tabela passa de 1000 em menos de um ano, e a leitura única
+// perdia em silêncio os meses MAIS RECENTES (a ordem é crescente).
 async function handleResumoFinanceiro(REST: string, headers: Record<string, string>, args: Record<string, any>) {
   const reYM = /^\d{4}-(0[1-9]|1[0-2])$/;
   const hoje = todayInSaoPaulo();
@@ -2547,12 +2745,12 @@ async function handleResumoFinanceiro(REST: string, headers: Record<string, stri
   }
 
   const limite = finNextMonth(finNextMonth(finNextMonth(ate > mesHoje ? ate : mesHoje))) + "-01";
-  const r = await fetch(
-    `${REST}/lifeos_movimentacoes?select=id,name,valor,date,tipo,created_at&date=lt.${limite}&order=date.asc,created_at.asc`,
-    { headers },
-  );
-  if (!r.ok) throw new Error(`select movimentacoes -> ${r.status} ${await r.text()}`);
-  const todas: Mov[] = (await r.json()).map((m: any) => ({ ...m, valor: finNum(m.valor), tipo: m.tipo ?? [] }));
+  const linhas = await selectTodas(REST, headers, "lifeos_movimentacoes", new URLSearchParams({
+    select: "id,name,valor,date,tipo,created_at",
+    date: `lt.${limite}`,
+    order: "date.asc,created_at.asc,id.asc",
+  }));
+  const todas: Mov[] = linhas.map((m: any) => ({ ...m, valor: finNum(m.valor), tipo: m.tipo ?? [] }));
   const porMes: Record<string, Mov[]> = {};
   for (const m of todas) (porMes[(m.date || "").slice(0, 7)] ??= []).push(m);
   const rowsDoMes = (ym: string) => porMes[ym] ?? [];
@@ -2603,7 +2801,7 @@ async function handleResumoFinanceiro(REST: string, headers: Record<string, stri
 
 // ── Tool: search_movimentacoes (Finanças) ─────────────────────────────────
 async function handleSearchMovimentacoes(REST: string, headers: Record<string, string>, args: Record<string, any>) {
-  const nome = args?.nome ? String(args.nome).trim().toLowerCase() : "";
+  const nome = args?.nome ? String(args.nome).trim() : "";
   const direcao = args?.direcao ? String(args.direcao) : "";
   if (direcao && !VOCAB.mov_direcao.includes(direcao)) return toolText(`Direção inválida: ${direcao}. Valores aceitos: ${VOCAB.mov_direcao.join(", ")}.`, true);
   const meioFiltro = strArray(args?.meio);
@@ -2611,28 +2809,33 @@ async function handleSearchMovimentacoes(REST: string, headers: Record<string, s
   if (invalidMeio.length) return toolText(`Meio(s) inválido(s): ${invalidMeio.join(", ")}. Valores aceitos: ${VOCAB.mov_meio.join(", ")}.`, true);
   const dataInicio = args?.data_inicio ? String(args.data_inicio) : "";
   const dataFim = args?.data_fim ? String(args.data_fim) : "";
+  const erroData = erroDatas(dataInicio, dataFim);
+  if (erroData) return erroData;
   const valorMin = args?.valor_min !== undefined ? Number(args.valor_min) : null;
   const valorMax = args?.valor_max !== undefined ? Number(args.valor_max) : null;
+  if ((valorMin !== null && !Number.isFinite(valorMin)) || (valorMax !== null && !Number.isFinite(valorMax))) {
+    return toolText("valor_min e valor_max precisam ser números.", true);
+  }
   // Intervalo fechado de datas = pedido de "ler o período": um mês tem ~100
   // linhas, e com teto de 50 o modelo recebia meio mês achando que era tudo.
   const limit = clampLimit(args?.limit, 20, (dataInicio && dataFim) ? 300 : 50);
 
-  const r = await fetch(`${REST}/lifeos_movimentacoes?order=date.desc`, { headers });
-  if (!r.ok) throw new Error(`select movimentacoes -> ${r.status} ${await r.text()}`);
-  const rows = await r.json();
+  // `tipo` guarda direção e meio juntos (ver FINANCAS.md): a direção é um
+  // `cs` (contém) e os meios um `ov` (qualquer um) na mesma coluna.
+  const q = new URLSearchParams();
+  q.set("select", "id,name,valor,date,tipo");
+  if (nome) q.set("name", "ilike." + ilikeContem(nome));
+  if (direcao) q.append("tipo", "cs." + pgArrayLiteral([direcao]));
+  if (meioFiltro.length) q.append("tipo", "ov." + pgArrayLiteral(meioFiltro));
+  if (dataInicio) q.append("date", "gte." + dataInicio);
+  if (dataFim) q.append("date", "lte." + dataFim);
+  if (valorMin !== null) q.append("valor", "gte." + valorMin);
+  if (valorMax !== null) q.append("valor", "lte." + valorMax);
+  q.set("order", "date.desc,created_at.desc,id.desc");
+  q.set("limit", String(limit));
+  const { rows, total: totalMatches } = await selectPagina(REST, headers, "lifeos_movimentacoes", q);
 
-  let movs = rows.map((row: any) => ({ id: row.id, name: row.name, valor: row.valor === null ? null : Number(row.valor), date: row.date, tipo: row.tipo ?? [] }));
-
-  if (nome) movs = movs.filter((m: any) => m.name.toLowerCase().includes(nome));
-  if (direcao) movs = movs.filter((m: any) => (m.tipo || []).includes(direcao));
-  if (meioFiltro.length) movs = movs.filter((m: any) => (m.tipo || []).some((t: string) => meioFiltro.includes(t)));
-  if (dataInicio) movs = movs.filter((m: any) => m.date >= dataInicio);
-  if (dataFim) movs = movs.filter((m: any) => m.date <= dataFim);
-  if (valorMin !== null) movs = movs.filter((m: any) => m.valor !== null && m.valor >= valorMin);
-  if (valorMax !== null) movs = movs.filter((m: any) => m.valor !== null && m.valor <= valorMax);
-
-  const totalMatches = movs.length;
-  const returned = movs.slice(0, limit);
+  const returned = rows.map((row: any) => ({ id: row.id, name: row.name, valor: row.valor === null ? null : Number(row.valor), date: row.date, tipo: row.tipo ?? [] }));
 
   return toolText(JSON.stringify({
     total_matches: totalMatches, returned: returned.length, truncated: totalMatches > returned.length, movimentacoes: returned,
